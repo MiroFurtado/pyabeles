@@ -5,15 +5,17 @@ Author: Miro Furtado
 for the Hoffman Lab @ Harvard
 
 
-TODO: Abstract away a Layer or Material class -> Doing, but currently no encapsulation of the Layer class so not the best practice. 
+TODO(Miro)
         * Fix Layer class encapsulation. 
       Get some clarity on units for Rho (is it different for Neutron vs X-Ray?)
-      Solve the inverse problem
-      Offload substrate simulation stuff onto the Experiment class -- ie. subst.doExperiment() returns an experiment class and then plotting it is part of Experiment.
+      Work on the inverse problem (expand past just Nelder-Mead simplex, add restarts, add parameter constraints)
+      Explore ML for X-Ray reflectivity fitting -> Potentially big performance enhancements, running a NN is way faster than doing a search through a large parameter space.
+      gitignore the pyc files
+      Add setup.py
 '''
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
+from scipy.optimize import minimize, basinhopping
 
 class Layer:
 
@@ -42,10 +44,12 @@ class Layer:
 class Scanner:
     ''' Class for the incident X-Ray probe, stores information about the wavelength (might extend as needed)
     '''
-    def __init__(self,lbda=1.54056,xray=True, error=0.1): #Default value is Copper K alpha
+    def __init__(self,lbda=1.54056,xray=True, error=0.1, background=0., offset=0.): #Default value is Copper K alpha
+        self.offset = offset #Theta offset in degrees
         self.lbda = lbda #Units of 10^-10 m (Angstrom)
         self.xray = True
         self.error = error
+        self.background = background #Background level of detection, assumed to be constant.
     
     def getLambda(self):
         return self.lbda
@@ -97,21 +101,6 @@ class Surface:
         self.rho = np.append(self.rho, layer.rho)
         self.irho = np.append(self.irho, layer.irho)
         self.sigma = np.append(self.sigma, layer.sigma)
-
-    # DEPRECATED in favor of addLayer, this function allows you to manually add a new layer.
-    def addLayer_d(self,dist, rhoN, irhoN=0, sigmaN=0, name = ""):
-        print("WARNING: Deprecated in favor of addLayer")
-        if(name != ""):
-            name = " " + name
-        if(self.verbose):
-            print("Adding new layer" + name + " to structure.")
-
-        self.N += 1
-        self.label.append(name)
-        self.d = np.append(self.d,dist)
-        self.rho = np.append(self.rho,rhoN)
-        self.irho = np.append(self.irho,irhoN)
-        self.sigma = np.append(self.sigma,sigmaN)
     
     #My implementation of the Abeles matrix formalism, built off of 
     # https://en.wikipedia.org/wiki/Transfer-matrix_method_(optics)#Abeles_matrix_formalism
@@ -122,10 +111,12 @@ class Surface:
 
         def getK(n): #Generates the wavevector for a given interface
             return np.sqrt(kz**2-4e-6*np.pi*(self.rho[n]+1j*self.irho[n]-self.rho[0]-1j*self.irho[0]))
-        def getR(n,k,kNext, nevotCroce=True): #Returns the Fresnel reflection coefficient between n and n+1
+        def getR(n,k,kNext, error='NC'): #Returns the Fresnel reflection coefficient between n and n+1
             Rn = (k-kNext)/(k+kNext)
-            if(nevotCroce): #Use the Nevot and Croce correction for surface roughness. TODO: Allow for custom error func
+            if(error is 'NC'): #Use the Nevot and Croce correction for surface roughness. TODO: Allow for custom error func
                 Rn *= np.exp(-2*k*kNext*self.sigma[n]**2)
+            elif(error is 'DW'): #Use Debye-Waller factor
+                Rn *= np.exp(-2*k**2*self.sigma[n]**2)
             return Rn
         def getBeta(k, n):
             if n==0: return 0.
@@ -162,8 +153,10 @@ class Surface:
             M10 = T10
             k = kNext
             
-        r = M01/M00
-        return np.absolute(r)**2
+        r = np.absolute(M01/M00)**2
+        r /= r.max()
+
+        return r
 
 
 class Experiment:
@@ -179,8 +172,10 @@ class Experiment:
         self.x = angles
         self.scanner = scanner
         self.surface = surf
+        self.footprintRatio = 10
         self.verbose = self.surface.verbose
         self.theory = R
+        self.kz = None
         if genR and R is None:
             R = self.genTheory(self.x, degrees=True)
             self.theory = R
@@ -191,36 +186,50 @@ class Experiment:
             self.lRefl = None
             self.refl = None
 
+    #Gets the parameters of the experiment as a list, useful for optimization. 
+    def get_params_list(self):
+        N = self.surface.N
+        params = [self.scanner.background, self.scanner.offset, self.footprintRatio]
+        params.extend(self.surface.d[1:N-1])
+        params.extend(self.surface.rho)
+        params.extend(self.surface.sigma)
+        return params
+
     #Simulates the X-Ray reflection intensity curve for the material - Note if degrees are specified, it overrides the experiment. 
     def genTheory(self, thetas=None, degrees=True, modify=True):
+        def SquareIntensity(alpha,factor,use=False):
+            if not use:
+                return np.ones(alpha.shape)
+            F=factor*np.sin(alpha)
+            return np.where(F<=1.0,F,np.ones(F.shape))
         if thetas is not None and modify:
             self.x = thetas
         if(self.verbose):
             print("Simulating X-Ray reflection intensity curve.")
         if degrees:
-            thetas = np.radians(self.x)
+            thetas = np.radians(self.x+self.scanner.offset)
         lbda = self.scanner.getLambda()
         kz = 2*np.pi/lbda*np.sin(thetas)
-        R = self.surface.abeles(kz)
+        R = self.surface.abeles(kz)*SquareIntensity(thetas,self.footprintRatio)+self.scanner.background
         if modify:
-            self.refl = R
-            self.lRefl = np.log10(R)
+            self.theory = R
+            self.kz = kz
         return R
 
     def simulateData(self, thetas=None, noise = 1., degrees=True, modify=True):
         if thetas is not None:
-            refl = genTheory(thetas, modify=modify)
+            refl = self.genTheory(thetas, modify=modify)
         else:
-            refl = self.refl
+            refl = self.theory
         errorV = noise*0.1*self.refl
         #errorV[errorV==0] = 1e-11
         refl = refl + np.random.randn(len(self.refl))*errorV
         if modify:
             self.refl = refl
-            self.lRefl = np.log10(refl)
+            self.lRefl = np.log10(refl) 
         return refl
 
-    def simulatePlot(self,thetas=None, degrees=True):
+    def theoryPlot(self,thetas=None, degrees=True):
         plt.title("X-Ray Reflectivity Curve")
         plt.ylabel("log(Intensity)")
         plt.xlabel("Theta (degrees)")
@@ -228,20 +237,87 @@ class Experiment:
             self.x = thetas
         plt.plot(self.x,np.log10(self.genTheory(thetas=thetas, degrees=degrees)))
 
-    def resids(self): #Error seems to be a constant, so its inclusion in the minimization seems unnecessary.  
+    def resids(self): #Residual between the measured/simulated data and the theoretical curve generated from the structure associated with the experiment. 
         if self.lRefl is None:
             print("Can't calculate residuals before simulating!")
         lRhat = np.log10(self.genTheory(self.x, modify=False))
-        toRet = (self.lRefl-lRhat)**2/(self.scanner.error**2*np.ones(len(lRhat)))
+        toRet = (np.log10(self.theory)-lRhat)**2/(self.scanner.error**2*np.ones(len(lRhat)))
         return toRet
 
     def nllf(self, d): #as a first go at it, let's try simulating where we know the surface almost completely EXCEPT for incorrect knowledge of gaps
         self.surface.d = d
-        return 0.5*np.sum(self.resids()) # + a constant term from uncertainty we neglect because, uh, it's a constant.
+        return np.sum(self.resids()) # + a constant term from uncertainty we neglect because, uh, it's a constant.
 
-    def fixSpacing(self, guess):
-        res = minimize(self.nllf, guess, method='nelder-mead')
-        self.surface.d = res.x
+class Fitter:
+    def __init__(self, exp, method="nm", modifyDefault=True,cutoff_begin=0,cutoff_end=0):
+        self.method = method
+        self.cutoff_b=cutoff_begin
+        self.cutoff_e=cutoff_end
+        self.modify = modifyDefault
+        self.exp = exp
+        self.numVars = self.exp.surface.N*3
+        self.fixed = np.full(self.numVars, False)
+        self.tries_per_var = np.full(self.numVars, 1)#NOTE: This scales by (tries)^N where N is number of params
+    
+    #Fixes the num-th variable.
+    def set_fixed(self, num):
+        self.fixed[num] = True
+
+    def fitThickness(self, guess=None, modify=None):
+        exp = self.exp
+        if guess is None:
+            guess = exp.surface.d
+        if(self.method is "nm"):
+            res = minimize(exp.nllf, guess, method='nelder-mead')
+            if not res.success:
+                print("Failed to converge to a correct structure.")
+                return exp.surface
+            elif (modify is None and self.modify) or modify:
+                exp.surface.d = res.x
+                return exp.surface
+            else: 
+                exp.surface.d = guess
+                toRet = exp.surface.copy()
+                toRet.d = res.x
+                return toRet
+
+    def fitAll(self, guess=None, modify=None):
+        exp = self.exp
+        if guess is None:
+            guess = [1e-6]
+            guess.extend([0.,0.])
+            guess.extend(exp.surface.d[1:self.exp.surface.N-1])
+            guess.extend(exp.surface.rho)
+            guess.extend(exp.surface.sigma)
+            guess = np.array(guess)
+        if(self.method is "nm"):
+            res = minimize(self.error, guess, method='nelder-mead',options={'maxiter':10000})
+        elif(self.method is "bh"):
+            res = basinhopping(self.error, guess, niter=1000)
+            return exp.surface, res.x
         if not res.success:
             print("Failed to converge to a correct structure.")
-        return self.surface
+            return exp.surface, res.x
+        else:
+            #exp.surface.d = res.x
+            return exp.surface, res.x
+
+    def error(self, guess):
+        # Parameter space is the entirety-> Sigma, d, etc. 
+        # Parameter vector p: first element is the background radiation, next N elements are thicknesses, next N elements are densities, next N-1 elements are sigmas
+        N = self.exp.surface.N
+        j = 3
+        if self.fixed is not None:
+            params = self.exp.get_params_list()
+            for i in range(0, len(self.fixed)):
+                if(self.fixed[i]):
+                    guess[i] = params[i]
+
+        self.exp.scanner.background = guess[0]
+        self.exp.scanner.offset = guess[1]
+        self.exp.footprintRatio = guess[2]
+        self.exp.surface.d[1:N-1] = guess[j:N+j-2]
+        self.exp.surface.rho = guess[N+j-2:2*N+j-2]
+        self.exp.surface.sigma = guess[2*N+j-2:]
+        return np.sum(self.exp.resids()[self.cutoff_b:self.cutoff_e])
+
