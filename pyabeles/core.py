@@ -337,7 +337,15 @@ class Fitter:
                 toRet.d = res.x
                 return toRet
 
-    def fit_all(self, guess=None, modify=None):
+    def fit(self, guess=None):
+        """
+        Fits the given data
+
+        Parameters
+        ----------
+        guess : np.array
+            Starting parameters to use when minimizing. Note: Starting guess is only used by simplex and basinhopping methods. DiffEv does not use guess. 
+        """
         exp = self.exp
         if guess is None:
             guess = [1e-6]
