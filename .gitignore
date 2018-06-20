@@ -3,3 +3,6 @@
 *.pyc
 pyabeles/.vscode/*
 *.DS_Store
+build/*
+dist/*
+pyabeles.egg-info/*
