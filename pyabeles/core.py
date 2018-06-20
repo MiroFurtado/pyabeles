@@ -16,6 +16,30 @@ TODO(Miro)
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize, basinhopping
+from scipy import stats
+
+def beamfrac(FWHM, length, angle):
+    """
+    Calculate the beam fraction intercepted by a sample.
+    Parameters
+
+    Used under license: https://raw.githubusercontent.com/refnx/refnx/ca6e457412dcda1285d42644e0451f24b6b3c21c/LICENSE
+    ----------
+    FWHM: float
+        The FWHM of the beam height
+    length: float
+        Length of the sample in mm
+    angle: float
+        Angle that the sample makes w.r.t the beam (degrees)
+    Returns
+    -------
+    beamfrac: float
+        The fraction of the beam that intercepts the sample
+    """
+    height_of_sample = length * np.sin(np.radians(angle))
+    beam_sd = FWHM / 2 / np.sqrt(2 * np.log(2))
+    probability = 2. * (stats.norm.cdf(height_of_sample / 2. / beam_sd) - 0.5)
+    return probability
 
 class Layer:
 
@@ -40,15 +64,24 @@ class Layer:
         c.addLayer(self)
         return c
 
-
 class Scanner:
-    ''' Class for the incident X-Ray probe, stores information about the wavelength (might extend as needed)
-    '''
-    def __init__(self,lbda=1.54056,xray=True, error=0.1, background=0., offset=0.): #Default value is Copper K alpha
+    """ Class for the incident X-Ray probe, stores information about the wavelength (might extend as needed)
+    """
+    def __init__(self,lbda=1.54056,xray=True, error=0.1, background=0., offset=0.,beam_width_sd=0.019449): #Default value is Copper K alpha
+        """
+        Initializes a new Scanner object
+
+        Parameters
+        ----------
+        offset: float
+            Offset in measured theta
+
+        """
         self.offset = offset #Theta offset in degrees
         self.lbda = lbda #Units of 10^-10 m (Angstrom)
         self.xray = True
         self.error = error
+        self.width_sd = beam_width_sd #UNIT IS mm BE CAREFUL!
         self.background = background #Background level of detection, assumed to be constant.
     
     def getLambda(self):
@@ -58,8 +91,9 @@ class Scanner:
 class Surface:
     ''' Class for the multilayered structure, allows you to define an empty structure and add layers to it.
     '''
-    def __init__(self, verbose=False):
+    def __init__(self, verbose=False, sample_width=1.):
         self.verbose = verbose
+        self.width = sample_width
         self.label = []
         self.N = 1
         self.d = np.array([0]) # Units of 10^-10 m (Angstrom) - Array of length N
@@ -172,7 +206,6 @@ class Experiment:
         self.x = angles
         self.scanner = scanner
         self.surface = surf
-        self.footprintRatio = 10
         self.verbose = self.surface.verbose
         self.theory = R
         self.kz = None
@@ -189,7 +222,7 @@ class Experiment:
     #Gets the parameters of the experiment as a list, useful for optimization. 
     def get_params_list(self):
         N = self.surface.N
-        params = [self.scanner.background, self.scanner.offset, self.footprintRatio]
+        params = [self.scanner.background, self.scanner.offset, self.surface.width]
         params.extend(self.surface.d[1:N-1])
         params.extend(self.surface.rho)
         params.extend(self.surface.sigma)
@@ -197,20 +230,22 @@ class Experiment:
 
     #Simulates the X-Ray reflection intensity curve for the material - Note if degrees are specified, it overrides the experiment. 
     def genTheory(self, thetas=None, degrees=True, modify=True):
-        def SquareIntensity(alpha,factor,use=False):
-            if not use:
-                return np.ones(alpha.shape)
-            F=factor*np.sin(alpha)
-            return np.where(F<=1.0,F,np.ones(F.shape))
         if thetas is not None and modify:
             self.x = thetas
         if(self.verbose):
             print("Simulating X-Ray reflection intensity curve.")
+        footprint_correction = 1.
+        if self.surface.width is not None:
+            footprint_correction = beamfrac(self.scanner.width_sd *
+                                                2.35,
+                                                self.surface.width,
+                                                self.x+self.scanner.offset)
         if degrees:
             thetas = np.radians(self.x+self.scanner.offset)
         lbda = self.scanner.getLambda()
         kz = 2*np.pi/lbda*np.sin(thetas)
-        R = self.surface.abeles(kz)*SquareIntensity(thetas,self.footprintRatio)+self.scanner.background
+        R = self.surface.abeles(kz)+self.scanner.background
+        R /= footprint_correction
         if modify:
             self.theory = R
             self.kz = kz
@@ -244,16 +279,28 @@ class Experiment:
         toRet = (np.log10(self.theory)-lRhat)**2/(self.scanner.error**2*np.ones(len(lRhat)))
         return toRet
 
-    def nllf(self, d): #as a first go at it, let's try simulating where we know the surface almost completely EXCEPT for incorrect knowledge of gaps
-        self.surface.d = d
-        return np.sum(self.resids()) # + a constant term from uncertainty we neglect because, uh, it's a constant.
-
 class Fitter:
-    def __init__(self, exp, method="nm", modifyDefault=True,cutoff_begin=0,cutoff_end=0):
+    def __init__(self, exp, method="nm", modify_default=True,cutoff_begin=0,cutoff_end=0):
+        """
+        Initializes a Fitter object for fitting X-Ray reflectivity curves.
+
+        Parameters
+        ----------
+        exp : Experiment
+            The Experiment object that we are trying to fit the curve for. This is important because it contains information about the sample, the scanning probe, etc.
+        method : str
+            String indicating what method of optimization you would like to use. Options include "nm" for Nelder-Mead simplex, "bh" for basinhopping/simiulated annealing.
+        modify_default : bool
+            Indicates whether the fit should modify the values in the Experiment object. Currently shakily implemented so no real guarantees.
+        cutoff_begin : int
+            Starting cutoff for what thetas to include in the fit (this can be useful to exclude non-linear beam footpring effects that can't be captured by the default beam footpring adjustments)
+        cutoff_end : int
+            Ending cutoff for what thetas to include in the fit (this can be useful to exclude background noise from the detector)
+        """
         self.method = method
         self.cutoff_b=cutoff_begin
         self.cutoff_e=cutoff_end
-        self.modify = modifyDefault
+        self.modify = modify_default
         self.exp = exp
         self.numVars = self.exp.surface.N*3
         self.fixed = np.full(self.numVars, False)
@@ -261,9 +308,18 @@ class Fitter:
     
     #Fixes the num-th variable.
     def set_fixed(self, num):
+        """Sets the num-th variable to be a fixed variable unchanged by the fit.
+
+        Parameters
+        ----------
+        num : int
+            Value of the variable to be fixed.
+        """
         self.fixed[num] = True
 
     def fitThickness(self, guess=None, modify=None):
+        """DEPRECATED AND TO BE REMOVED"""
+        print("fitThickness is DEPRECATED AND TO BE REMOVED")
         exp = self.exp
         if guess is None:
             guess = exp.surface.d
@@ -281,11 +337,11 @@ class Fitter:
                 toRet.d = res.x
                 return toRet
 
-    def fitAll(self, guess=None, modify=None):
+    def fit_all(self, guess=None, modify=None):
         exp = self.exp
         if guess is None:
             guess = [1e-6]
-            guess.extend([0.,0.])
+            guess.extend([0.,1.])
             guess.extend(exp.surface.d[1:self.exp.surface.N-1])
             guess.extend(exp.surface.rho)
             guess.extend(exp.surface.sigma)
@@ -315,7 +371,7 @@ class Fitter:
 
         self.exp.scanner.background = guess[0]
         self.exp.scanner.offset = guess[1]
-        self.exp.footprintRatio = guess[2]
+        self.exp.surface.width = guess[2]
         self.exp.surface.d[1:N-1] = guess[j:N+j-2]
         self.exp.surface.rho = guess[N+j-2:2*N+j-2]
         self.exp.surface.sigma = guess[2*N+j-2:]
