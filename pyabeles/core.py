@@ -7,15 +7,11 @@ for the Hoffman Lab @ Harvard
 
 TODO(Miro)
         * Fix Layer class encapsulation. 
-      Get some clarity on units for Rho (is it different for Neutron vs X-Ray?)
-      Work on the inverse problem (expand past just Nelder-Mead simplex, add restarts, add parameter constraints)
       Explore ML for X-Ray reflectivity fitting -> Potentially big performance enhancements, running a NN is way faster than doing a search through a large parameter space.
-      gitignore the pyc files
-      Add setup.py
 '''
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize, basinhopping
+from scipy.optimize import minimize, basinhopping, differential_evolution as de
 from scipy import stats
 
 def beamfrac(FWHM, length, angle):
@@ -63,6 +59,10 @@ class Layer:
         c = other.copy()
         c.addLayer(self)
         return c
+    
+    def set_thickness(self,d):
+        self.d = d
+        return self
 
 class Scanner:
     """ Class for the incident X-Ray probe, stores information about the wavelength (might extend as needed)
@@ -93,7 +93,7 @@ class Surface:
     '''
     def __init__(self, verbose=False, sample_width=1.):
         self.verbose = verbose
-        self.width = sample_width
+        self.width = sample_width #Units of mm (TODO: Double check this) - float
         self.label = []
         self.N = 1
         self.d = np.array([0]) # Units of 10^-10 m (Angstrom) - Array of length N
@@ -209,6 +209,7 @@ class Experiment:
         self.verbose = self.surface.verbose
         self.theory = R
         self.kz = None
+        self.scale = 1.
         if genR and R is None:
             R = self.genTheory(self.x, degrees=True)
             self.theory = R
@@ -222,9 +223,9 @@ class Experiment:
     #Gets the parameters of the experiment as a list, useful for optimization. 
     def get_params_list(self):
         N = self.surface.N
-        params = [self.scanner.background, self.scanner.offset, self.surface.width]
+        params = [self.scale,self.scanner.background, self.scanner.offset, self.surface.width]
         params.extend(self.surface.d[1:N-1])
-        params.extend(self.surface.rho)
+        params.extend(self.surface.rho[1:])
         params.extend(self.surface.sigma)
         return params
 
@@ -244,8 +245,9 @@ class Experiment:
             thetas = np.radians(self.x+self.scanner.offset)
         lbda = self.scanner.getLambda()
         kz = 2*np.pi/lbda*np.sin(thetas)
-        R = self.surface.abeles(kz)+self.scanner.background
-        R /= footprint_correction
+        R = self.surface.abeles(kz)/footprint_correction
+        R += self.scanner.background
+        R /= R[0]
         if modify:
             self.theory = R
             self.kz = kz
@@ -280,7 +282,7 @@ class Experiment:
         return toRet
 
 class Fitter:
-    def __init__(self, exp, method="nm", modify_default=True,cutoff_begin=0,cutoff_end=0):
+    def __init__(self, exp, method="nm", modify_default=True,cutoff_begin=0,cutoff_end=9223372036854775807, bounds = None):
         """
         Initializes a Fitter object for fitting X-Ray reflectivity curves.
 
@@ -302,9 +304,31 @@ class Fitter:
         self.cutoff_e=cutoff_end
         self.modify = modify_default
         self.exp = exp
-        self.numVars = self.exp.surface.N*3
-        self.fixed = np.full(self.numVars, False)
-        self.tries_per_var = np.full(self.numVars, 1)#NOTE: This scales by (tries)^N where N is number of params
+        self.num_vars = 9 #TODO: This is unacceptable, but is kept here for testing purposes. Also, var name is not PEP8 compliant.
+        self.fixed = np.full(self.num_vars, False) #TODO: Fix to include all variables, this only works by luck currently.
+
+        self.bounds = bounds
+        self.params_dict = {
+            "background": 1,
+            "theta offset": 2,
+            "sample width": 3,
+        }
+    
+    def bounds_from_guess(self,guess=None):
+        """Initializes default values for the bounds from a guess, given that bounds is None
+
+        Parameters
+        ----------
+        guess : np.array
+            Array of guesses for the parameters.
+        """
+        if guess is None:
+            guess = self.default_guess()
+        self.bounds = [(0.75*a,1.25*a) for a in guess]
+        self.bounds[1] = (0.,2*guess[1])
+        self.bounds[2] = (-2*guess[2],2*guess[2])
+        self.bounds[3] = (0.1,5)
+
     
     #Fixes the num-th variable.
     def set_fixed(self, num):
@@ -316,26 +340,30 @@ class Fitter:
             Value of the variable to be fixed.
         """
         self.fixed[num] = True
+    
+    def set_free(self, num):
+        """Sets the num-th variable to be a free variable
 
-    def fitThickness(self, guess=None, modify=None):
-        """DEPRECATED AND TO BE REMOVED"""
-        print("fitThickness is DEPRECATED AND TO BE REMOVED")
-        exp = self.exp
-        if guess is None:
-            guess = exp.surface.d
-        if(self.method is "nm"):
-            res = minimize(exp.nllf, guess, method='nelder-mead')
-            if not res.success:
-                print("Failed to converge to a correct structure.")
-                return exp.surface
-            elif (modify is None and self.modify) or modify:
-                exp.surface.d = res.x
-                return exp.surface
-            else: 
-                exp.surface.d = guess
-                toRet = exp.surface.copy()
-                toRet.d = res.x
-                return toRet
+        Parameters
+        ----------
+        num : int
+            Value of the variable to be freed.
+        """
+        self.fixed[num] = False
+
+    def set_bound(self, num, bound):
+        self.bounds[num] = bound
+
+    def default_guess(self):
+        """Returns a default guess
+        """
+        guess = [1.,1e-6]
+        guess.extend([0.1,1.])
+        guess.extend(self.exp.surface.d[1:self.exp.surface.N-1])
+        guess.extend(self.exp.surface.rho[1:])
+        guess.extend(self.exp.surface.sigma)
+        guess = np.array(guess)
+        return guess
 
     def fit(self, guess=None):
         """
@@ -348,17 +376,16 @@ class Fitter:
         """
         exp = self.exp
         if guess is None:
-            guess = [1e-6]
-            guess.extend([0.,1.])
-            guess.extend(exp.surface.d[1:self.exp.surface.N-1])
-            guess.extend(exp.surface.rho)
-            guess.extend(exp.surface.sigma)
-            guess = np.array(guess)
+            guess = self.default_guess()
         if(self.method is "nm"):
             res = minimize(self.error, guess, method='nelder-mead',options={'maxiter':10000})
         elif(self.method is "bh"):
             res = basinhopping(self.error, guess, niter=1000)
             return exp.surface, res.x
+        elif(self.method is "de"):
+            if self.bounds is None:
+                self.bounds_from_guess(guess)
+            res = de(self.error, self.bounds,popsize=20,mutation=(1.,1.5))
         if not res.success:
             print("Failed to converge to a correct structure.")
             return exp.surface, res.x
@@ -370,18 +397,18 @@ class Fitter:
         # Parameter space is the entirety-> Sigma, d, etc. 
         # Parameter vector p: first element is the background radiation, next N elements are thicknesses, next N elements are densities, next N-1 elements are sigmas
         N = self.exp.surface.N
-        j = 3
+        j = 4
         if self.fixed is not None:
             params = self.exp.get_params_list()
             for i in range(0, len(self.fixed)):
                 if(self.fixed[i]):
                     guess[i] = params[i]
-
-        self.exp.scanner.background = guess[0]
-        self.exp.scanner.offset = guess[1]
-        self.exp.surface.width = guess[2]
+        self.exp.scale = guess[0] #Currently this is unused
+        self.exp.scanner.background = guess[1]
+        self.exp.scanner.offset = guess[2]
+        self.exp.surface.width = guess[3]
         self.exp.surface.d[1:N-1] = guess[j:N+j-2]
-        self.exp.surface.rho = guess[N+j-2:2*N+j-2]
-        self.exp.surface.sigma = guess[2*N+j-2:]
+        self.exp.surface.rho[1:] = guess[N+j-2:2*N+j-3]
+        self.exp.surface.sigma = guess[2*N+j-3:]
         return np.sum(self.exp.resids()[self.cutoff_b:self.cutoff_e])
 
